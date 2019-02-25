@@ -157,6 +157,7 @@ include("common.jl")
 
 # Include utilities
 include("utils/IO/base_checks.jl")
+include("utils/timearray.jl")
 
 # PowerSystems models
 include("models/topological_elements.jl")
@@ -169,6 +170,7 @@ include("models/generation.jl")
 include("models/storage.jl")
 include("models/loads.jl")
 include("models/services.jl")
+include("models/demand.jl")
 
 # Include all auto-generated structs.
 include("models/generated/includes.jl")
