@@ -74,7 +74,7 @@ function read_csv_data(file_path::String, baseMVA::Float64)
             end
         end
 
-        for r in eachrow(tsp_raw)
+        for r in DataFrames.eachrow(tsp_raw)
             fpath = joinpath(file_path,r[Symbol("Data File")])
             if isfile(fpath)
                 # read data and insert into dict
