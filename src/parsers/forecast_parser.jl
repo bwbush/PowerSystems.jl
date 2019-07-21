@@ -1,242 +1,229 @@
-function get_name_and_csv(path_to_filename)
-    df = CSV.File(path_to_filename) |> DataFrames.DataFrame
-    folder = splitdir(splitdir(path_to_filename)[1])[2]
-    return folder, df
+struct ForecastInfo
+    simulation::String
+    component::Component
+    label::String  # Component field on which timeseries data is based.
+    per_unit::Bool  # Whether per_unit conversion is needed.
+    data::TimeSeries.TimeArray
+    file_path::String
+
+    function ForecastInfo(simulation, component, label, per_unit, data, file_path)
+        new(simulation, component, label, per_unit, data, abspath(file_path))
+    end
 end
 
+struct ForecastInfos
+    forecasts::Vector{ForecastInfo}
+    data_files::Dict{String, TimeSeries.TimeArray}
+end
 
-# Parser for Forecasts dat files
+function ForecastInfos()
+    return ForecastInfos(Vector{ForecastInfo}(),
+                         Dict{String, TimeSeries.TimeArray}())
+end
+
 """
-Read all forecast CSV's in the path provided, the struct of the data should
-follow this format
-folder : PV
-            file : DAY_AHEAD
-            file : REAL_TIME
-Folder name should be the device type
-Files should only contain one real-time and day-ahead forecast
-Args:
-    files: A string
-Returns:
-    A dictionary with the CSV files as dataframes and folder names as keys
-# TODO : Stochasti/Multiple scenarios
+    forecast_csv_parser!(sys::System,
+                         directory_or_file::AbstractString,
+                         simulation="Simulation",
+                         category::Type{<:Component}=Component,
+                         label="scalingfactor";
+                         resolution=nothing,
+                         kwargs...)
+
+Add forecasts to the System from CSV files.
+
+# Arguments
+- `sys::System`: system
+- `directory_or_file::AbstractString`: directory to search for files or a specific file
+- `simulation::AbstractString`: simulation name
+- `category::DataType`: category of component for the forecast; can be abstract or concrete
+- `label::AbstractString`: forecast label
+- `resolution::Dates.DateTime=nothing`: only store forecasts with this resolution
+- `per_unit::Bool=false`: convert to per_unit
+- `REGEX_FILE::Regex`: only look at files matching this regular expression
+
+Refer to [`add_forecasts!`](@ref) for exceptions thrown.
 """
- function read_data_files(rootpath::String; kwargs...)
-   if :REGEX_FILE in keys(kwargs)
-        REGEX_FILE = kwargs[:REGEX_FILE]
+function forecast_csv_parser!(
+                              sys::System,
+                              directory_or_file::AbstractString,
+                              simulation="Simulation",
+                              category::Type{<:Component}=Component,
+                              label="init",
+                              ; resolution=nothing,
+                              kwargs...
+                             )
+    forecast_infos = parse_forecast_data_files(sys, directory_or_file, simulation, category,
+                                               label; kwargs...)
+
+    return _forecast_csv_parser!(sys, forecast_infos, resolution)
+end
+
+function _forecast_csv_parser!(sys::System, forecast_infos::ForecastInfos, resolution)
+    for forecast in forecast_infos.forecasts
+        len = length(forecast.data)
+        @assert len >= 2
+        timestamps = TimeSeries.timestamp(forecast.data)
+        res = timestamps[2] - timestamps[1]
+        if !isnothing(resolution) && res != resolution
+            @debug "Skip forecast with resolution=$res; doesn't match user=$resolution"
+            continue
+        end
+
+        if forecast.component isa LoadZones
+            uuids = Set([get_uuid(x) for x in forecast.component.buses])
+            forecast_components = [load for load in get_components(ElectricLoad, sys)
+                                   if get_bus(load) |> get_uuid in uuids]
+        else
+            forecast_components = [forecast.component]
+        end
+
+        timeseries = forecast.data[Symbol(get_name(forecast.component))]
+        if forecast.per_unit
+            # PERF
+            # TimeSeries.TimeArray is immutable; forced to copy.
+            timeseries = timeseries ./ sys.basepower
+            @debug "Converted timeseries to per_unit" forecast
+        end
+
+        forecasts = [Deterministic(x, forecast.label, timeseries)
+                     for x in forecast_components]
+        add_forecasts!(sys, forecasts)
+    end
+end
+
+function get_forecast_component(sys::System, category, name)
+    if isconcretetype(category)
+        component = get_component(category, sys, name)
     else
-        REGEX_FILE = r"(.*?)\.csv"
+        components = get_components_by_name(category, sys, name)
+        if length(components) == 0
+            throw(DataFormatError(
+                "Did not find component for forecast category=$category name=$name"))
+        elseif length(components) == 1
+            component = components[1]
+        else
+            msg = "Found duplicate names type=$(category) name=$(name)"
+            throw(DataFormatError(msg))
+        end
     end
 
-    DATA = Dict{String, Any}()
-    data = Dict{String, Any}()
-    DATA["gen"] = data
+    return component
+end
+
+"""
+    read_time_array(file_path::AbstractString, component_name=nothing)
+
+Return a TimeArray from a CSV file.
+
+Pass component_name when the file does not have the component name in a column header.
+"""
+function read_time_array(file_path::AbstractString, component_name=nothing; kwargs...)
+    if !isfile(file_path)
+        msg = "Timeseries file doesn't exist : $file_path"
+        throw(DataFormatError(msg))
+    end
+
+    file = CSV.File(file_path)
+    @debug "Read CSV data from $file_path."
+
+    return read_time_array(get_timeseries_format(file), file, component_name; kwargs...)
+end
+
+function parse_forecast_data_files(
+                                   sys::System,
+                                   path::AbstractString,
+                                   simulation::AbstractString,
+                                   category::Type{<:Component},
+                                   label::AbstractString;
+                                   kwargs...
+                                  )
+    forecast_infos = ForecastInfos()
+
+    if isdir(path)
+        filenames = get_forecast_files(path; kwargs...)
+    elseif isfile(path)
+        filenames = [path]
+    else
+        throw(InvalidParameter("$path is neither a directory nor file"))
+    end
+
+    per_unit = get(kwargs, :per_unit, false)
+    for filename in filenames
+        add_forecast_data!(sys, forecast_infos, simulation, category, label, per_unit,
+                           filename)
+    end
+
+    return forecast_infos
+end
+
+function add_forecast_data!(
+                            infos::ForecastInfos,
+                            simulation::AbstractString,
+                            component::Component,
+                            label::AbstractString,
+                            per_unit::Bool,
+                            data_file::AbstractString,
+                           )
+    timeseries = _add_forecast_data!(infos, data_file, get_name(component))
+    forecast = ForecastInfo(simulation, component, label, per_unit, timeseries, data_file)
+    push!(infos.forecasts, forecast)
+    @debug "Added ForecastInfo" forecast
+end
+
+function add_forecast_data!(
+                            sys::System,
+                            infos::ForecastInfos,
+                            simulation::AbstractString,
+                            category::Type{<:Component},
+                            label::AbstractString,
+                            per_unit::Bool,
+                            data_file::AbstractString,
+                           )
+    timeseries = _add_forecast_data!(infos, data_file, nothing)
+
+    for component_name in TimeSeries.colnames(timeseries)
+        component = get_forecast_component(sys, category, string(component_name))
+        forecast = ForecastInfo(simulation, component, label, per_unit, timeseries,
+                                data_file)
+        push!(infos.forecasts, forecast)
+        @debug "Added ForecastInfo" forecast
+    end
+end
+
+function _add_forecast_data!(infos::ForecastInfos, data_file::AbstractString,
+                             component_name::Union{Nothing, String})
+    if !haskey(infos.data_files, data_file)
+        infos.data_files[data_file] = read_time_array(data_file, component_name)
+        @debug "Added timeseries file" data_file
+    end
+
+    return infos.data_files[data_file]
+end
+
+"""Return a Vector of forecast data filenames."""
+function get_forecast_files(rootpath::String; kwargs...)
+    filenames = Vector{String}()
+    regex = get(kwargs, :REGEX_FILE, r"^[^\.](.*?)\.csv")
 
     for (root, dirs, files) in walkdir(rootpath)
-
+        # Skip hidden directories unless the user passed it in.
+        if length([x for x in splitdir(root) if startswith(x, ".")]) > 0 && root != rootpath
+            @debug "Skip hidden directory $root"
+            continue
+        end
         for filename in files
-
-            path_to_filename = joinpath(root, filename)
-            if match(REGEX_FILE, path_to_filename) != nothing
-                folder_name, csv_data = get_name_and_csv(path_to_filename)
-                if folder_name == "load"
-                    DATA["load"] = read_datetime(csv_data; kwargs...)
-                else
-                    data[folder_name] = read_datetime(csv_data; kwargs...)
-                end
-                @info "Successfully parsed $rootpath"
-            else
-                @warn "Unable to match regex with $path_to_filename"
+            if !isnothing(match(regex, filename))
+                path_to_filename = joinpath(root, filename)
+                push!(filenames, path_to_filename)
             end
         end
-
     end
 
-    return DATA
+    return filenames
 end
 
-"""
-Args:
-    PowerSystems Dictionary
-    Dictionary of all the data files
-Returns:
-    Returns an dictionary with Device name as key and PowerSystems Forecasts
-    dictionary as values
-"""
-function assign_ts_data(ps_dict::Dict{String,Any},ts_dict::Dict{String,Any})
-    if haskey(ts_dict,"load")
-        ps_dict["load"] =  PowerSystems.add_time_series_load(ps_dict,ts_dict["load"])
-    else
-        @warn "Not assigning time series to loads"
-    end
-
-    if haskey(ts_dict,"gen")
-        ts_map = _retrieve(ts_dict["gen"], Union{TimeSeries.TimeArray,DataFrames.DataFrame})
-        for (key,val) in ts_map
-            ts = _access(ts_dict["gen"],vcat(val,key))
-            dd_map = _retrieve(ps_dict["gen"],key)
-            if length(dd_map) > 0 
-                dd_map = string.(unique(values(dd_map))[1]) 
-            else
-                @warn("no $key entries in psdict")
-                continue
-            end
-            dd = _access(ps_dict["gen"],vcat(dd_map,key))
-            dd = PowerSystems.add_time_series(dd,ts)
-        end
-    else
-        @warn "Not assigning time series to gens"
-    end
-
-    return ps_dict
-end
-
-function make_device_forecast(device::D, df::DataFrames.DataFrame, resolution::Dates.Period,horizon::Int) where {D<:Device}
-    time_delta = Dates.Minute(df[2,:DateTime]-df[1,:DateTime])
-    initialtime = df[1,:DateTime] # TODO :read the correct date/time when that was issued  forecast
-    last_date = df[end,:DateTime]
-    ts_dict = Dict{Any,Dict{Int,TimeSeries.TimeArray}}()
-    ts_raw =  TimeSeries.TimeArray(df[1],df[2])
-    for ts in initialtime:resolution:last_date
-        ts_dict[ts] = Dict{Int,TimeSeries.TimeArray}(1 => ts_raw[ts:time_delta:(ts+resolution)])
-    end
-    forecast = Dict{String,Any}("horizon" =>horizon,
-                                            "resolution" => resolution, #TODO : fix type conversion to JSON
-                                            "interval" => time_delta,   #TODO : fix type conversion to JSON
-                                            "initialtime" => initialtime,
-                                            "device" => device,
-                                            "data" => ts_dict
-                                            )
-    return forecast
-end
-
- # -Parse csv file to dict
-"""
-Args:
-    Dictionary of all the data files
-    Length of the forecast - Week()/Dates.Day()/Dates.Hour()
-    Forecast horizon in hours - Int64
-    Array of PowerSystems devices in the systems - Renewable Generators and
-    Loads
-Returns:
-    Returns an dictionary with Device name as key and PowerSystems Forecasts
-    dictionary as values
-"""
-function make_forecast_dict(time_series::Dict{String,Any},
-                            resolution::Dates.Period, horizon::Int,
-                            Devices::Array{Generator,1})
-    forecast = Dict{String,Any}()
-    for device in Devices
-        for (key_df,df) in time_series
-            if device.name in map(String, names(df))
-                for name in map(String, names(df))
-                    if name == device.name
-                        forecast[device.name] = make_device_forecast(device, df[[:DateTime, Symbol(device.name)]], resolution, horizon)
-                    end
-                end
-            end
-        end
-        if !haskey(forecast,device.name)
-            @info "No forecast found for $(device.name) "
-        end
-    end
-    return forecast
-end
-
-"""
-Args:
-    Dictionary of all the data files
-    Length of the forecast - Week()/Dates.Day()/Dates.Hour()
-    Forecast horizon in hours - Int64
-    Array of PowerSystems devices in the systems- Loads
-Returns:
-    Returns an dictionary with Device name as key and PowerSystems Forecasts
-    dictionary as values
-"""
-function make_forecast_dict(time_series::Dict{String,Any},
-                            resolution::Dates.Period, horizon::Int,
-                            Devices::Array{ElectricLoad,1})
-    forecast = Dict{String,Any}()
-    for device in Devices
-        if haskey(time_series,"load")
-            if device.bus.name in  map(String, names(time_series["load"]))
-                df = time_series["load"][[:DateTime,Symbol(device.bus.name)]]
-                forecast[device.name] = make_device_forecast(device, df, resolution, horizon)
-            end
-        else
-            @warn "No forecast found for Loads"
-        end
-    end
-    return forecast
-end
-
-
-"""
-Args:
-    Dictionary of all the data files
-    Length of the forecast - Week()/Dates.Day()/Dates.Hour()
-    Forecast horizon in hours - Int64
-    Array of PowerSystems devices in the systems- Loads
-    Array of PowerSystems LoadZones
-
-Returns:
-    Returns an dictionary with Device name as key and PowerSystems Forecasts
-    dictionary as values
-"""
-function make_forecast_dict(time_series::Dict{String,Any},
-                            resolution::Dates.Period, horizon::Int,
-                            Devices::Array{ElectricLoad,1},
-                            LoadZones::Array{Device,1})
-    forecast = Dict{String,Any}()
-    for device in Devices
-        if haskey(time_series,"load")
-            for lz in LoadZones
-                if device.bus in lz.buses
-                    df = time_series["load"][[:DateTime,Symbol(lz.name)]]
-                    forecast[device.name] = make_device_forecast(device, df, resolution, horizon)
-                end
-            end
-        else
-            @warn "No forecast found for Loads"
-        end
-    end
-    return forecast
-end
-
-
-# - Parse Dict to Forecast Struct
-
-"""
-Args:
-    A PowerSystems forecast dictionary
-Returns:
-    A PowerSystems forecast stuct array
-"""
-function make_forecast_array(dict)
-    Forecasts = Array{Forecast}(undef, 0)
-    for (device_key,device_dict) in dict
-                push!(Forecasts,Deterministic(device_dict["device"],device_dict["horizon"],
-                                device_dict["resolution"],device_dict["interval"],
-                                device_dict["initialtime"],
-                                device_dict["data"]
-                                ))
-    end
-    return Forecasts
-end
-
-# Write dict to Json
-
-function write_to_json(filename,Forecasts_dict)
-    for (type_key,type_fc) in Forecasts_dict
-        for (device_key,device_dicts) in type_fc
-            stringdata =JSON.json(device_dicts, 3)
-            open("$filename/$device_key.json", "w") do f
-                write(f, stringdata)
-             end
-        end
-    end
-end
-
-
+#=
 # Parse json to dict
 #TODO : fix broken data formats
 function parse_json(filename,device_names)
@@ -247,10 +234,11 @@ function parse_json(filename,device_names)
             open("$filename/x$name.json", "r") do f
             global temp
             dicttxt = readstring(f)  # file information to string
-            temp=JSON.parse(dicttxt)  # parse and transform data
+            temp=JSON2.read(dicttxt,Dict{Any,Array{Dict}})  # parse and transform data
             Devices[name] = temp
             end
         end
     end
     return Devices
 end
+=#

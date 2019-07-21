@@ -12,11 +12,7 @@ docs/build/*
 *.m
 *.RAW
 *.zip
-*.json
 data
 *.bak
 *~
-
-tmp/
-*.tmp
-*.sw?
+*.vscode
